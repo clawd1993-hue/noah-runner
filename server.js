@@ -69,6 +69,35 @@ function retrieve(query, budget = 320000) {
   return out;
 }
 
+// ---------- on-demand search tools (the model can call these to refine its own lookup) ----------
+function searchBrain(query, limit = 12) {
+  const words = [...new Set((String(query).toLowerCase().match(/[a-z0-9]{3,}/g) || []).filter(w => !STOP.has(w)))];
+  if (!words.length) return [];
+  const scored = BRAIN.map(f => {
+    const lt = f.text.toLowerCase(), ln = f.rel.toLowerCase();
+    let score = 0;
+    for (const w of words) { if (ln.includes(w)) score += 8; if (lt.includes(w)) score += 2; }
+    return { f, score };
+  }).filter(x => x.score > 0).sort((a, b) => b.score - a.score).slice(0, limit);
+  return scored.map(({ f }) => {
+    const lines = f.text.split('\n'), hits = [];
+    for (let i = 0; i < lines.length && hits.length < 4; i++) {
+      const ll = lines[i].toLowerCase();
+      if (words.some(w => ll.includes(w))) hits.push(lines[i].trim().slice(0, 200));
+    }
+    return { file: f.rel, snippets: hits };
+  });
+}
+function readBrainFile(rel) {
+  const f = BRAIN.find(x => x.rel === rel) || BRAIN.find(x => x.rel.toLowerCase().includes(String(rel).toLowerCase()));
+  if (!f) return null;
+  return f.text.length > 60000 ? f.text.slice(0, 60000) + '\n…[truncated]' : f.text;
+}
+const TOOLS = [
+  { name: 'search_brain', description: "Search Clawd's ENTIRE brain (all ~900 memory files + SOPs) by keywords. Returns matching file paths with snippet lines. Use this FIRST to find where something is. If the first search misses, try again with different/alternate keywords (synonyms, related terms) before giving up.", input_schema: { type: 'object', properties: { query: { type: 'string', description: 'keywords to search for' } }, required: ['query'] } },
+  { name: 'read_file', description: 'Read the full text of one brain file by its path (use a path returned by search_brain).', input_schema: { type: 'object', properties: { file: { type: 'string' } }, required: ['file'] } }
+];
+
 const SYSTEM = `You are Noah — Michael's always-online recovery bot.
 
 WHO YOU ARE: A calm, sharp backup brain that lives in the cloud, independent of Michael's Mac mini. You hold the complete knowledge of "Clawd" (Michael's main AI partner/COO) and all of Clawd's sub-agents, plus how the whole OpenClaw system is wired.
@@ -78,7 +107,9 @@ YOUR ONE JOB: If Michael has lost Clawd or the Mac mini is down, help him get ev
 HOW TO ANSWER:
 - Talk like a competent friend. Plain language. Short. No walls of text.
 - In a restore, give ONE step at a time, confirm it worked, then the next.
-- Ground every answer in the CONTEXT files below. If something isn't in your knowledge, say so plainly — don't invent.
+- Ground every answer in Clawd's brain. You have an initial CONTEXT slice below, PLUS two tools: search_brain (find files by keyword) and read_file (open a file fully).
+- BEFORE you ever say "I don't have that" / "it's not loaded" — you MUST call search_brain (try a few different keywords/synonyms). The full brain is searchable; a miss usually means wrong keywords, not missing data. Only say you don't know after search genuinely comes up empty.
+- When you cite something, quote the exact line and name the file.
 - The encrypted vault lives on Google Drive (clawd1993@gmail.com), newest file clawd-vault-core-YYYY-MM-DD.tar.gz.enc. The passphrase is ONLY in Michael's password manager.
 - Once Clawd is restored, Clawd takes back over as normal operator; your job ends.
 
@@ -86,18 +117,37 @@ You are talking ONLY to Michael. Use the CONTEXT below (relevant slices of Clawd
 
 async function askClaude(userText) {
   const context = retrieve(userText);
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({
-      model: MODEL, max_tokens: 1500,
-      system: SYSTEM + '\n\n===== CONTEXT (Clawd brain slices) =====' + context,
-      messages: [{ role: 'user', content: userText }]
-    })
-  });
-  const j = await r.json();
-  if (j.error) { console.error('anthropic error', j.error); return `⚠️ Brain error: ${j.error.message || 'unknown'}`; }
-  return (j.content || []).map(c => c.text).join('\n').trim() || '(no reply)';
+  const system = SYSTEM + '\n\n===== CONTEXT (initial Clawd brain slices — use search_brain/read_file for anything not here) =====' + context;
+  const messages = [{ role: 'user', content: userText }];
+  for (let turn = 0; turn < 6; turn++) {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: MODEL, max_tokens: 1500, system, tools: TOOLS, messages })
+    });
+    const j = await r.json();
+    if (j.error) { console.error('anthropic error', j.error); return `⚠️ Brain error: ${j.error.message || 'unknown'}`; }
+    const blocks = j.content || [];
+    messages.push({ role: 'assistant', content: blocks });
+    const toolUses = blocks.filter(b => b.type === 'tool_use');
+    if (!toolUses.length) {
+      return blocks.filter(b => b.type === 'text').map(c => c.text).join('\n').trim() || '(no reply)';
+    }
+    const results = [];
+    for (const tu of toolUses) {
+      let content;
+      if (tu.name === 'search_brain') {
+        const hits = searchBrain(tu.input && tu.input.query);
+        content = hits.length ? hits.map(h => `FILE: ${h.file}\n  ${h.snippets.join('\n  ')}`).join('\n\n') : 'No matches — try different keywords.';
+      } else if (tu.name === 'read_file') {
+        content = readBrainFile(tu.input && tu.input.file) || `File not found: ${tu.input && tu.input.file}`;
+      } else content = 'Unknown tool.';
+      console.log(`tool ${tu.name}:`, JSON.stringify(tu.input));
+      results.push({ type: 'tool_result', tool_use_id: tu.id, content });
+    }
+    messages.push({ role: 'user', content: results });
+  }
+  return '⚠️ (search ran long — ask me again, maybe narrower)';
 }
 
 // ---------- telegram ----------
