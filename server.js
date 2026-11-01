@@ -115,10 +115,25 @@ HOW TO ANSWER:
 
 You are talking ONLY to Michael. Use the CONTEXT below (relevant slices of Clawd's brain) to answer.`;
 
-async function askClaude(userText) {
+// ---------- conversation memory (so Noah can walk Michael through a multi-step restore) ----------
+// Keyed by chatId. Stores CLEAN turns only (user text + Noah's final text) — tool-call noise is
+// kept only inside a single call. Capped so context stays small. Resets on redeploy (fine — a live
+// restore convo survives; across a redeploy you just re-ask). /reset clears it manually.
+const HIST = new Map();
+const MAX_TURNS = 16; // 8 back-and-forth exchanges
+function getHist(chatId) { return HIST.get(chatId) || []; }
+function pushHist(chatId, role, text) {
+  const h = getHist(chatId);
+  h.push({ role, content: text });
+  while (h.length > MAX_TURNS) h.shift();
+  HIST.set(chatId, h);
+}
+
+async function askClaude(userText, chatId) {
   const context = retrieve(userText);
   const system = SYSTEM + '\n\n===== CONTEXT (initial Clawd brain slices — use search_brain/read_file for anything not here) =====' + context;
-  const messages = [{ role: 'user', content: userText }];
+  // seed with prior clean conversation turns, then this message
+  const messages = [...getHist(chatId), { role: 'user', content: userText }];
   for (let turn = 0; turn < 6; turn++) {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -131,7 +146,11 @@ async function askClaude(userText) {
     messages.push({ role: 'assistant', content: blocks });
     const toolUses = blocks.filter(b => b.type === 'tool_use');
     if (!toolUses.length) {
-      return blocks.filter(b => b.type === 'text').map(c => c.text).join('\n').trim() || '(no reply)';
+      const finalText = blocks.filter(b => b.type === 'text').map(c => c.text).join('\n').trim() || '(no reply)';
+      // persist clean turns so the NEXT message remembers this exchange
+      pushHist(chatId, 'user', userText);
+      pushHist(chatId, 'assistant', finalText);
+      return finalText;
     }
     const results = [];
     for (const tu of toolUses) {
@@ -170,9 +189,10 @@ async function poll() {
       const m = u.message; if (!m || !m.text) continue;
       const chatId = String(m.chat.id);
       if (chatId !== OWNER_CHAT_ID) { await send(chatId, "Sorry — I'm Michael's private recovery bot and can't help here."); continue; }
-      if (m.text === '/start') { await send(chatId, "🛟 Hey Michael — I'm Noah, your backup brain. I'm always online, and I hold Clawd's entire memory + how to restore everything if the mini ever goes down. Ask me anything, or if something's broken, just tell me what happened and I'll walk you through it."); continue; }
+      if (m.text === '/start') { await send(chatId, "🛟 Hey Michael — I'm Noah, your backup brain. I'm always online, and I hold Clawd's entire memory + how to restore everything if the mini ever goes down. Ask me anything, or if something's broken, just tell me what happened and I'll walk you through it — I remember our conversation, so we can go step by step."); continue; }
+      if (m.text === '/reset') { HIST.delete(chatId); await send(chatId, "🧹 Fresh start — I've cleared our conversation. What's up?"); continue; }
       await tg('sendChatAction', { chat_id: chatId, action: 'typing' });
-      const reply = await askClaude(m.text);
+      const reply = await askClaude(m.text, chatId);
       await send(chatId, reply);
     }
   } catch (e) { console.error('poll error', e.message); }
